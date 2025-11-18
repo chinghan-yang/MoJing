@@ -352,6 +352,7 @@ def main():
 
     win_name = "Video BG + Pose Ripples + Cats (Film-like ripples)"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     while True:
         # 背景影格循環
