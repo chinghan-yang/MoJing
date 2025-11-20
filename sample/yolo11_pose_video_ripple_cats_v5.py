@@ -220,25 +220,31 @@ def overlay_bgra_center(canvas: np.ndarray, bgra: np.ndarray, cx: int, cy: int, 
 # ---------- 幾何工具 ----------
 
 def nearest_point_on_circle(center: Tuple[int, int], radius: int, p: Tuple[float, float]) -> Tuple[int, int]:
+    # 把任意點 p（例如鼻子座標）「投影」到以 center 為圓心、radius 為半徑的圓周上，得到「圓邊上離 p 最近的點」
     cx, cy = center
-    vx, vy = p[0] - cx, p[1] - cy
-    norm = (vx * vx + vy * vy) ** 0.5
-    if norm < 1e-3:
+    vx, vy = p[0] - cx, p[1] - cy # 先算從圓心 C(cx,cy) 指向點 P(px,py) 的向量 v
+    norm = (vx * vx + vy * vy) ** 0.5 # 計算向量 v 的長度
+    if norm < 1e-3: # 特例處理：如果 P 幾乎就在圓心（避免除以 0），就選擇圓心右側的圓周點作為預設（(𝑐𝑥+𝑅,𝑐𝑦)）
         return (cx + radius, cy)
-    ux, uy = vx / norm, vy / norm
+    ux, uy = vx / norm, vy / norm # 把 v 正規化成單位向量 u，方向仍是由圓心指向點 P
+    # 在 u 的方向上，從圓心走「半徑」的距離，得到圓周上的點 C+R⋅u。最後四捨五入成整數像素座標
     px = int(round(cx + ux * radius))
     py = int(round(cy + uy * radius))
     return px, py
 
 
 def tangent_angle_deg(center: Tuple[int, int], p: Tuple[int, int], clockwise: bool = True, offset_deg: float = 0.0) -> float:
+    # 回傳「圓心到點 p 的切線方向角度（度數）」；用來讓貓圖沿圓邊切齊切線旋轉
     cx, cy = center
-    rx, ry = p[0] - cx, p[1] - cy
-    if clockwise:
-        tx, ty = (ry, -rx)
+    rx, ry = p[0] - cx, p[1] - cy # 取得徑向向量 r（由圓心指向點 p）
+    if clockwise: # 由徑向向量 r 轉 90° 得到切向向量 t：
+        tx, ty = (ry, -rx) # 順時針切線：(ry,−rx)（等於把 r 旋轉 -90°）
     else:
-        tx, ty = (-ry, rx)
-    angle = np.degrees(np.arctan2(ty, tx))
+        tx, ty = (-ry, rx) # 逆時針切線：(−ry,rx)（把 r 旋轉 +90°）
+        # 二者都與 r 垂直（t·r = 0），方向分別沿圓周的兩個轉向
+
+    angle = np.degrees(np.arctan2(ty, tx)) # 取切向量 t 的方向角（以 +x 軸為 0°），由弧度轉成度數
+    # 回傳角度並加上微調量 offset_deg（用來校正素材本身的“正上方”定義，例如要讓貓的“頂端”對齊切線可加 ±90/180 做微調）
     return float(angle + offset_deg)
 
 # ---------- 水波（影片風格）核心：區域折射位移 ----------
@@ -396,21 +402,26 @@ def main():
         pair: List[Tuple[float, int, int]] = []
         for tid, tr in tracks.items():
             for j, c in enumerate(centers):
-                d = ((tr.center[0]-c[0])**2 + (tr.center[1]-c[1])**2) ** 0.5
-                if d <= args.match_thresh:
+                d = ((tr.center[0]-c[0])**2 + (tr.center[1]-c[1])**2) ** 0.5 # 逐一計算每個 track 目前中心 tr.center 與本幀候選鼻子 centers[j] 的歐氏距離 d
+                if d <= args.match_thresh: # 小於門檻, 表示「track tid ↔ 候選 j」是可配對的可能
                     pair.append((d, tid, j))
-        pair.sort(key=lambda x: x[0])
-        assigned_t, assigned_c = set(), set()
+        pair.sort(key=lambda x: x[0]) # 將 pair 依距離由小到大排序，準備做最短距離優先的貪婪匹配
+        assigned_t, assigned_c = set(), set() # 用 assigned_t / assigned_c 兩個集合，確保一個 track 與一個候選最多只會被配對一次
         for _, tid, j in pair:
-            if tid in assigned_t or j in assigned_c:
+            if tid in assigned_t or j in assigned_c: # 依序走訪排序後的 pair：若某筆的 track 或候選已被配對就略過；否則視為成功匹配：
                 continue
+            # 更新 tr.center = centers[j] 與 tr.last_seen = now（追蹤到人、刷新時間）
             tr = tracks[tid]
             tr.center = centers[j]
             tr.last_seen = now
             assigned_t.add(tid); assigned_c.add(j)
+            # 若是第一次看見，設定 tr.hold_start = now，開始計時「臉部五點連續存在」的時間
             if tr.hold_start is None:
                 tr.hold_start = now
+
+            # 當此 track 尚未觸發、且「現在 - hold_start ≥ face_hold_sec」（預設 3 秒），並且全域冷卻 now - last_global_trigger ≥ trigger_cooldown 也通過時：
             if (not tr.triggered) and (now - tr.hold_start >= args.face_hold_sec) and (now - last_global_trigger >= args.trigger_cooldown):
+                # 取鼻子位置 (nx, ny)（夾在畫面邊界內），新增一個 Ripple 物件到 ripples，其參數（波長、速度、幅度、衰減、高光）都來自 CLI。
                 nx, ny = tr.center
                 nx = int(np.clip(nx, 0, w - 1)); ny = int(np.clip(ny, 0, h - 1))
                 # 建立「影片風格」水波
@@ -421,13 +432,14 @@ def main():
                                       radial_decay=args.ripple_radial_decay,
                                       time_tau=args.ripple_time_tau,
                                       highlight=args.ripple_highlight))
+                # 設 last_global_trigger = now 與 tr.triggered = True → 同一人只觸發一次，且用全域冷卻避免同時多發
                 last_global_trigger = now
                 tr.triggered = True
-                if cats_loaded > 0:
-                    cat_raw = random.choice(raw_cats)
-                    px, py = nearest_point_on_circle(center, radius - 6, (nx, ny))
-                    rot = tangent_angle_deg(center, (px, py), clockwise=True, offset_deg=args.rot_offset)
-                    tr.cat = CatOverlay(base=cat_raw, start=now, duration=max(0.5, args.cat_fade), cx=float(px), cy=float(py), rot_deg=rot)
+                if cats_loaded > 0: # 若有載到貓圖
+                    cat_raw = random.choice(raw_cats) # 隨機挑一張縮放後的 cat_raw
+                    px, py = nearest_point_on_circle(center, radius - 6, (nx, ny)) # 用 nearest_point_on_circle(...) 找出鼻子對圓形視窗邊框最近的點 (px, py)。
+                    rot = tangent_angle_deg(center, (px, py), clockwise=True, offset_deg=args.rot_offset) # 用 tangent_angle_deg(...) 算出該點的切線角度（讓貓圖沿圓邊方向旋轉）
+                    tr.cat = CatOverlay(base=cat_raw, start=now, duration=max(0.5, args.cat_fade), cx=float(px), cy=float(py), rot_deg=rot) # 建立 CatOverlay(...) 並掛到 tr.cat（含淡入時間、初始位置與角度）
 
         # 新增未配對 tracks
         for j, c in enumerate(centers):
