@@ -21,7 +21,7 @@ import numpy as np
 
 DISPLAY_W, DISPLAY_H = 1920, 1080  # 視窗顯示解析度（固定）
 DEFAULT_FPS_FALLBACK = 30          # 取不到 FPS 時的預設
-RECORD_DIR = Path("recordings")    # 錄影輸出資料夾
+RECORD_DIR = Path("../recordings")    # 錄影輸出資料夾
 
 
 def build_argparser() -> argparse.ArgumentParser:

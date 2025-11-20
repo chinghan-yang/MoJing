@@ -1,0 +1,7 @@
+# warning file
+*.csv
+*.xlsx
+*.json
+*.log
+input/*
+output/*
