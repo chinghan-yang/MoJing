@@ -1,14 +1,14 @@
 """
-YOLO11 Pose 視訊背景＋條件觸發水波＆貓咪淡入（修改版）
+YOLO11 Pose 視訊背景＋條件觸發水波＆貓咪淡入（沿圓邊旋轉＆跟隨 + 影片風格水波）
 Python 3.11
 
-修改重點：
-1. 水波中心固定在畫面原點（圓心），不再跟隨人臉位置。
-2. 觸發條件新增限制：只有在「場上沒有任何貓咪」時，才能觸發新特效。
-3. 關鍵點偵測條件更嚴格：除五官外，新增左右肩膀（共7點）都必須偵測到。
+新增（對齊上傳 Ripple.mp4 的視覺風格）：
+- 將水波改為 **折射變形（refraction displacement）**，以徑向正弦波 + 時間/半徑衰減模擬真實水面。
+- 以 `cv2.remap` 做區域像素位移，支援多個同時波紋，並可調波長、速度、幅度、衰減與高光強度。
+- 保留先前功能：貓圖沿圓邊切線旋轉＆跟隨、同人只觸發一次、離開則貓消失、PNG Alpha 淡入、圓形遮罩、骨架疊圖。
 
 執行示例：
-  python yolo11_pose_video_ripple_cats_v5_mod.py \
+  python yolo11_pose_video_ripple_cats_v4.1.py \
     --bg_video ./calm_water.mp4 \
     --cats ./cat0.png,./cat1.png,./cat2.png,./cat3.png,./cat4.png \
     --cat_size_ratio 0.25 --cat_fade 3.0 --follow_smooth 0.18 \
@@ -28,9 +28,8 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-# [修改點 3] 新增左右肩膀偵測
-# COCO 17 關鍵點：0鼻, 1左眼, 2右眼, 3左耳, 4右耳, 5左肩, 6右肩
-FACE_IDXS = [0, 1, 2, 3, 4, 5, 6]
+# COCO 17 關鍵點：0鼻,1左眼,2右眼,3左耳,4右耳
+FACE_IDXS = [0, 1, 2, 3, 4]
 
 # 連線（骨架）
 COCO_EDGES = [
@@ -48,46 +47,58 @@ COCO_EDGES = [
 # ----------------- 水波（影片風格）資料結構 -----------------
 @dataclass
 class Ripple:
-    x: float
+    # 定義「單一水波事件」的資料結構與壽命判定邏輯
+    x: float # 水波中心座標（像素）。
     y: float
-    start: float
-    wavelength: float
-    speed: float
-    amp: float
-    radial_decay: float
-    time_tau: float
-    highlight: float
+    start: float # 水波開始時間戳（time.time()）。用來計算經過多久、波擴散到哪裡。
+    # 視覺參數（可由 CLI 指定預設）
+    wavelength: float    # 波長（像素）：控制波紋峰與峰的間距。數值越大，紋路越疏
+    speed: float         # 相速度（像素/秒）：控制波峰向外擴散的速度
+    amp: float           # 位移幅度（像素）：在折射變形（cv2.remap）時的最大偏移量，決定波的扭曲強度
+    radial_decay: float  # 徑向衰減係數：距離中心越遠，衰減越快（指數衰減），避免整張畫面都被強烈扭曲 (越大越快消失)
+    time_tau: float      # 時間衰減常數 τ（秒）：控制隨時間衰退的快慢（強度約按（e^-t/tau）變小）
+    highlight: float     # 高光強度 0~1：波峰的亮度加成係數，用來模擬水面反光閃爍
 
     def alive(self, now: float) -> bool:
+        # 回傳這個水波是否「還需要被渲染」
+        # 生命期：當時間衰減很小或擴散過大就視為結束
         t = now - self.start
+        # 當經過的時間超過 ~5 個 τ 就視為可忽略：因為 e^{-5} ≈ 0.0067，波紋影響幾乎看不見，便可回收避免多做運算，提升效能
         return t < (self.time_tau * 5.0)
 
 # ----------------- 貓圖與追蹤 -----------------
 @dataclass
 class CatOverlay:
-    base: np.ndarray
-    start: float
-    duration: float = 3.0
-    cx: float = 0.0
+    # 定義「一隻貓圖疊加物件」以及它的淡入進度計算
+    base: np.ndarray  # 已先依 --cat_size_ratio 縮放好的貓圖，且為 BGRA（含透明度）。用這個底圖做每幀旋轉與貼圖，避免每幀再縮放耗效能
+    start: float # 此貓開始出現的時間戳，用來計算淡入經過了多久
+    duration: float = 3.0  # 淡入所需秒數，預設 3 秒
+    cx: float = 0.0  # 螢幕上的放置中心座標（以圖中心對齊），程式每幀把它沿著圓邊更新，讓貓跟著鼻子在圓邊移動
     cy: float = 0.0
-    rot_deg: float = 0.0
+    rot_deg: float = 0.0 # 當前旋轉角度（度），會被設成圓的切線方向，之後用來呼叫 rotate_with_alpha()
     def alpha(self, now: float) -> float:
+        # 回傳 0～1 的淡入係數：
+        # 先算經過比例，max(1e-6, ...) 避免 duration=0 時除以零；
         a = (now - self.start) / max(1e-6, self.duration)
+        # 再用clip到 [0,1]。這個值後面會乘上圖的每像素 alpha，在 overlay_bgra_center(...) 做正確的透明度混合，形成平滑淡入效果。
         return float(np.clip(a, 0.0, 1.0))
 
 @dataclass
 class Track:
-    id: int
-    center: Tuple[float, float]
-    last_seen: float
-    hold_start: Optional[float] = None
-    triggered: bool = False
+    # 代表「被追蹤的某一位使用者」的狀態，用來做多人配對、觸發一次性特效、以及後續的貓圖跟隨
+    id: int # 這條追蹤的唯一識別碼
+    center: Tuple[float, float] # 這個人的代表座標（本專案用鼻子的位置）。用來做「與新一幀鼻子清單」的距離配對、以及放水波與沿圓邊定位貓圖
+    last_seen: float # 最後一次在畫面中「看到」這個人的時間戳。配合 --miss_timeout 判斷人是否離場；離場就刪掉 Track，同時讓貓消失
+    hold_start: Optional[float] = None # 當偵測到此人「五個臉部點（鼻/眼/耳）同時存在」的開始時間。只有「連續滿 --face_hold_sec 秒」才允許觸發（避免瞬間誤檢）
+    triggered: bool = False # 是否已經觸發過一次「水波＋貓淡入」。為 True 後就不再對同一人重複觸發
+    # 與此 Track 綁定的貓圖疊加物件（若已觸發）。裡面記錄貓圖的淡入時間、當前沿圓邊的位置與旋轉角度，讓它能持續跟隨該人的鼻子沿圓邊移動；
+    # 當這個 Track 因離場被移除時，這個 cat 也就不再繪製
     cat: Optional[CatOverlay] = None
 
 # ----------------- 參數 -----------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="YOLO11 Pose｜修改版：固定波心、無貓才觸發、含肩膀偵測")
+    p = argparse.ArgumentParser(description="YOLO11 Pose｜影片背景＋水波＆貓淡入（旋轉跟隨 + 影片風格水波）")
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--weights", type=str, default="yolo11n-pose.pt")
     p.add_argument("--imgsz", type=int, default=640)
@@ -122,6 +133,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 # ----------------- 共用工具 -----------------
+COCO_EDGES = COCO_EDGES
 
 def create_circular_mask(h: int, w: int, center: Tuple[int, int] | None = None, radius: int | None = None) -> np.ndarray:
     if center is None:
@@ -218,25 +230,31 @@ def overlay_bgra_center(canvas: np.ndarray, bgra: np.ndarray, cx: int, cy: int, 
 # ---------- 幾何工具 ----------
 
 def nearest_point_on_circle(center: Tuple[int, int], radius: int, p: Tuple[float, float]) -> Tuple[int, int]:
+    # 把任意點 p（例如鼻子座標）「投影」到以 center 為圓心、radius 為半徑的圓周上，得到「圓邊上離 p 最近的點」
     cx, cy = center
-    vx, vy = p[0] - cx, p[1] - cy
-    norm = (vx * vx + vy * vy) ** 0.5
-    if norm < 1e-3:
+    vx, vy = p[0] - cx, p[1] - cy # 先算從圓心 C(cx,cy) 指向點 P(px,py) 的向量 v
+    norm = (vx * vx + vy * vy) ** 0.5 # 計算向量 v 的長度
+    if norm < 1e-3: # 特例處理：如果 P 幾乎就在圓心（避免除以 0），就選擇圓心右側的圓周點作為預設（(𝑐𝑥+𝑅,𝑐𝑦)）
         return (cx + radius, cy)
-    ux, uy = vx / norm, vy / norm
+    ux, uy = vx / norm, vy / norm # 把 v 正規化成單位向量 u，方向仍是由圓心指向點 P
+    # 在 u 的方向上，從圓心走「半徑」的距離，得到圓周上的點 C+R⋅u。最後四捨五入成整數像素座標
     px = int(round(cx + ux * radius))
     py = int(round(cy + uy * radius))
     return px, py
 
 
 def tangent_angle_deg(center: Tuple[int, int], p: Tuple[int, int], clockwise: bool = True, offset_deg: float = 0.0) -> float:
+    # 回傳「圓心到點 p 的切線方向角度（度數）」；用來讓貓圖沿圓邊切齊切線旋轉
     cx, cy = center
-    rx, ry = p[0] - cx, p[1] - cy
-    if clockwise:
-        tx, ty = (ry, -rx)
+    rx, ry = p[0] - cx, p[1] - cy # 取得徑向向量 r（由圓心指向點 p）
+    if clockwise: # 由徑向向量 r 轉 90° 得到切向向量 t：
+        tx, ty = (ry, -rx) # 順時針切線：(ry,−rx)（等於把 r 旋轉 -90°）
     else:
-        tx, ty = (-ry, rx)
-    angle = np.degrees(np.arctan2(ty, tx))
+        tx, ty = (-ry, rx) # 逆時針切線：(−ry,rx)（把 r 旋轉 +90°）
+        # 二者都與 r 垂直（t·r = 0），方向分別沿圓周的兩個轉向
+
+    angle = np.degrees(np.arctan2(ty, tx)) # 取切向量 t 的方向角（以 +x 軸為 0°），由弧度轉成度數
+    # 回傳角度並加上微調量 offset_deg（用來校正素材本身的“正上方”定義，例如要讓貓的“頂端”對齊切線可加 ±90/180 做微調）
     return float(angle + offset_deg)
 
 # ---------- 水波（影片風格）核心：區域折射位移 ----------
@@ -251,6 +269,7 @@ def apply_ripples_refraction(canvas: np.ndarray, ripples: List[Ripple], now: flo
         if not rp.alive(now):
             continue
         t = now - rp.start
+        # 影響半徑（隨時間擴散，外加 3 個波長裕度）
         R = int(min(max(rp.speed * t + 3 * rp.wavelength, rp.wavelength * 2), max(H, W)))
         x0 = max(0, int(rp.x - R)); y0 = max(0, int(rp.y - R))
         x1 = min(W, int(rp.x + R)); y1 = min(H, int(rp.y + R))
@@ -259,6 +278,7 @@ def apply_ripples_refraction(canvas: np.ndarray, ripples: List[Ripple], now: flo
 
         roi = src[y0:y1, x0:x1]
         h, w = roi.shape[:2]
+        # 座標網格（以波中心為原點）
         xs = np.arange(w, dtype=np.float32); ys = np.arange(h, dtype=np.float32)
         X, Y = np.meshgrid(xs, ys)
         dx = X + x0 - rp.x
@@ -266,7 +286,8 @@ def apply_ripples_refraction(canvas: np.ndarray, ripples: List[Ripple], now: flo
         r = np.sqrt(dx * dx + dy * dy) + 1e-6
 
         k = 2.0 * np.pi / rp.wavelength
-        phase = k * (r - rp.speed * t)
+        phase = k * (r - rp.speed * t)  # sin(k r - ω t)，其中 ω = k * v
+        # 位移（徑向）：幅度 × 正弦 × 衰減（半徑與時間）
         decay = np.exp(-rp.radial_decay * r) * np.exp(-t / rp.time_tau)
         disp = (rp.amp * np.sin(phase) * decay).astype(np.float32)
         ux = (dx / r).astype(np.float32); uy = (dy / r).astype(np.float32)
@@ -276,11 +297,13 @@ def apply_ripples_refraction(canvas: np.ndarray, ripples: List[Ripple], now: flo
 
         distorted = cv2.remap(roi, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
+        # 高光（沿波峰），模擬反光閃爍
         if rp.highlight > 1e-3:
-            crest = (np.cos(phase) * 0.5 + 0.5) ** 6
+            crest = (np.cos(phase) * 0.5 + 0.5) ** 6  # 越接近波峰越亮
             crest *= decay
             crest = np.clip(crest * rp.highlight, 0.0, 1.0).astype(np.float32)
             hl = (crest[..., None] * 255.0).astype(np.uint8)
+            # 疊加到亮度：轉成 YUV 做亮度加成較自然
             yuv = cv2.cvtColor(distorted, cv2.COLOR_BGR2YUV)
             yuv[:, :, 0] = np.clip(yuv[:, :, 0].astype(np.int32) + (hl[:, :, 0] // 6), 0, 255).astype(np.uint8)
             distorted = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
@@ -292,21 +315,25 @@ def apply_ripples_refraction(canvas: np.ndarray, ripples: List[Ripple], now: flo
 def main():
     args = parse_args()
 
+    # 背景影片
     bgcap = cv2.VideoCapture(args.bg_video)
     if not bgcap.isOpened():
         raise FileNotFoundError(f"無法開啟背景影片：{args.bg_video}")
 
+    # 攝影機（用於偵測）
     cam = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW) if cv2.getBuildInformation().find("MSVC") != -1 else cv2.VideoCapture(args.camera)
     cam.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cam.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     if not cam.isOpened():
         raise RuntimeError("無法開啟攝影機。")
 
+    # 模型
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_half = device.startswith("cuda")
     model = YOLO(args.weights)
     model.to(device)
 
+    # 讀取貓圖（保留 Alpha，並先縮放到目標比例）
     def discover_cat_paths(cats_arg: str) -> List[str]:
         paths: List[str] = []
         if cats_arg:
@@ -324,26 +351,31 @@ def main():
         img = cv2.imread(pth, cv2.IMREAD_UNCHANGED)
         if img is not None:
             if img.ndim == 3 and img.shape[2] == 3:
+                # 把沒有透明度通道的貓圖（BGR，3 通道）轉成含透明度的 4 通道（BGRA）
                 a = np.full((img.shape[0], img.shape[1], 1), 255, dtype=np.uint8)
                 img = np.concatenate([img, a], axis=2)
+            # 預縮放到比例;把原圖寬度乘上縮放比例，並且並設下最小 8 像素，避免比例太小造成 0 或過小尺寸
             tw = max(8, int(img.shape[1] * args.cat_size_ratio))
             th = max(8, int(img.shape[0] * args.cat_size_ratio))
             raw_cats.append(cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR))
     cats_loaded = len(raw_cats)
 
+    # 狀態
     prev_t = time.time(); fps = 0.0
     ripples: List[Ripple] = []
     next_track_id = 1
     tracks: Dict[int, Track] = {}
     last_global_trigger: float = 0.0
 
-    win_name = "Video BG + Pose Ripples + Cats (Mod V5)"
+    win_name = "Video BG + Pose Ripples + Cats (Film-like ripples)"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     while True:
+        # 背景影格循環
+        # 嘗試讀取下一張背景影格；ok_bg 表示是否成功、bg_frame 是影格資料。
         ok_bg, bg_frame = bgcap.read()
-        if not ok_bg or bg_frame is None:
+        if not ok_bg or bg_frame is None: # 若讀不到（例如影片播到尾端或解碼失敗），把播放位置設回第 0 張影格再讀一次，達到循環播放的效果；若重讀仍失敗就拋出錯誤。
             bgcap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ok_bg, bg_frame = bgcap.read()
             if not ok_bg or bg_frame is None:
@@ -351,112 +383,127 @@ def main():
         canvas = resize_fit(bg_frame, args.width, args.height)
         h, w = canvas.shape[:2]
 
+        # 圓形參數
         diameter = int(min(h, w) * args.circle_ratio)
         radius = diameter // 2
         center = (w // 2, h // 2)
 
+        # 攝影機影格
         ok_cam, cam_frame = cam.read()
         if not ok_cam:
             print("讀取攝影機影像失敗，嘗試繼續……")
             continue
 
+        # 推論
         results = model(cam_frame, imgsz=args.imgsz, conf=args.conf, verbose=False, half=use_half)
         res = results[0]
         kxy, kcf = extract_kpts(res)
 
-        centers: List[Tuple[float, float]] = []
-        for i in range(kxy.shape[0]):
-            cf = kcf[i]
-            # [修改點 3] 判斷條件改為 FACE_IDXS (現在包含肩膀)
-            if all(cf[idx] > 0.25 for idx in FACE_IDXS):
-                centers.append((float(kxy[i, 0, 0]), float(kxy[i, 0, 1])))
+        # 候選（五臉點）
+        centers: List[Tuple[float, float]] = [] # 準備一List放每個人的代表座標（x, y）。型別註記表示元素是兩個浮點數的 tuple
+        for i in range(kxy.shape[0]): # 逐一走訪這一幀偵測到的每個人
+            cf = kcf[i] # 取出第 i 個人的各關鍵點信心值（與 kxy 對應的 confidence）
+            if all(cf[idx] > 0.25 for idx in FACE_IDXS): # 只有當此人五個臉部關鍵點（鼻、左眼、右眼、左耳、右耳）都存在且信心值 > 0.25，才視為有效臉部
+                centers.append((float(kxy[i, 0, 0]), float(kxy[i, 0, 1])))  # 鼻
 
         now = time.time()
 
+        # 追蹤匹配
         pair: List[Tuple[float, int, int]] = []
         for tid, tr in tracks.items():
             for j, c in enumerate(centers):
-                d = ((tr.center[0]-c[0])**2 + (tr.center[1]-c[1])**2) ** 0.5
-                if d <= args.match_thresh:
+                d = ((tr.center[0]-c[0])**2 + (tr.center[1]-c[1])**2) ** 0.5 # 逐一計算每個 track 目前中心 tr.center 與本幀候選鼻子 centers[j] 的歐氏距離 d
+                if d <= args.match_thresh: # 小於門檻, 表示「track tid ↔ 候選 j」是可配對的可能
                     pair.append((d, tid, j))
-        pair.sort(key=lambda x: x[0])
-        assigned_t, assigned_c = set(), set()
+        pair.sort(key=lambda x: x[0]) # 將 pair 依距離由小到大排序，準備做最短距離優先的貪婪匹配
+        assigned_t, assigned_c = set(), set() # 用 assigned_t / assigned_c 兩個集合，確保一個 track 與一個候選最多只會被配對一次
         for _, tid, j in pair:
-            if tid in assigned_t or j in assigned_c:
+            if tid in assigned_t or j in assigned_c: # 依序走訪排序後的 pair：若某筆的 track 或候選已被配對就略過；否則視為成功匹配：
                 continue
+            # 更新 tr.center = centers[j] 與 tr.last_seen = now（追蹤到人、刷新時間）
             tr = tracks[tid]
             tr.center = centers[j]
             tr.last_seen = now
             assigned_t.add(tid); assigned_c.add(j)
+            # 若是第一次看見，設定 tr.hold_start = now，開始計時「臉部五點連續存在」的時間
             if tr.hold_start is None:
                 tr.hold_start = now
 
-            # [修改點 2] 檢查場上是否有任何貓咪 (任意 Track 的 cat 不為 None)
-            cats_on_screen = any(t.cat is not None for t in tracks.values())
-
-            if (not tr.triggered) and \
-               (now - tr.hold_start >= args.face_hold_sec) and \
-               (now - last_global_trigger >= args.trigger_cooldown) and \
-               (not cats_on_screen):  # 只有當場上沒貓時才觸發
-
-                nx, ny = tr.center # 仍然需要鼻子的位置來算貓的生成位置
-                nx_clip = int(np.clip(nx, 0, w - 1))
-                ny_clip = int(np.clip(ny, 0, h - 1))
-
-                # [修改點 1] 水波生成位置強制設為畫面中心 (center[0], center[1])
-                ripples.append(Ripple(x=center[0], y=center[1], start=now,
+            # 當此 track 尚未觸發、且「現在 - hold_start ≥ face_hold_sec」（預設 3 秒），並且全域冷卻 now - last_global_trigger ≥ trigger_cooldown 也通過時：
+            if (not tr.triggered) and (now - tr.hold_start >= args.face_hold_sec) and (now - last_global_trigger >= args.trigger_cooldown):
+                # 取鼻子位置 (nx, ny)（夾在畫面邊界內），新增一個 Ripple 物件到 ripples，其參數（波長、速度、幅度、衰減、高光）都來自 CLI。
+                nx, ny = tr.center
+                nx = int(np.clip(nx, 0, w - 1)); ny = int(np.clip(ny, 0, h - 1))
+                # 建立「影片風格」水波
+                ripples.append(Ripple(x=nx, y=ny, start=now,
                                       wavelength=args.ripple_lambda,
                                       speed=args.ripple_speed,
                                       amp=args.ripple_amp,
                                       radial_decay=args.ripple_radial_decay,
                                       time_tau=args.ripple_time_tau,
                                       highlight=args.ripple_highlight))
-
+                # 設 last_global_trigger = now 與 tr.triggered = True → 同一人只觸發一次，且用全域冷卻避免同時多發
                 last_global_trigger = now
                 tr.triggered = True
-                if cats_loaded > 0:
-                    cat_raw = random.choice(raw_cats)
-                    px, py = nearest_point_on_circle(center, radius - 6, (nx_clip, ny_clip))
-                    rot = tangent_angle_deg(center, (px, py), clockwise=True, offset_deg=args.rot_offset)
-                    tr.cat = CatOverlay(base=cat_raw, start=now, duration=max(0.5, args.cat_fade), cx=float(px), cy=float(py), rot_deg=rot)
+                if cats_loaded > 0: # 若有載到貓圖
+                    cat_raw = random.choice(raw_cats) # 隨機挑一張縮放後的 cat_raw
+                    px, py = nearest_point_on_circle(center, radius - 6, (nx, ny)) # 用 nearest_point_on_circle(...) 找出鼻子對圓形視窗邊框最近的點 (px, py)。
+                    rot = tangent_angle_deg(center, (px, py), clockwise=True, offset_deg=args.rot_offset) # 用 tangent_angle_deg(...) 算出該點的切線角度（讓貓圖沿圓邊方向旋轉）
+                    tr.cat = CatOverlay(base=cat_raw, start=now, duration=max(0.5, args.cat_fade), cx=float(px), cy=float(py), rot_deg=rot) # 建立 CatOverlay(...) 並掛到 tr.cat（含淡入時間、初始位置與角度）
 
-        for j, c in enumerate(centers):
-            if j in assigned_c:
+        # 新增未配對 tracks
+        for j, c in enumerate(centers): # 走訪本幀所有候選中心點（我們用鼻子座標 c=(x,y) 代表一個人）
+            if j in assigned_c: # 若這個候選 j 已在前一段配對流程中成功分配給某個既有 track，就跳過；留下來的就是沒被配對（= 新進場或與舊 track 距離過大）的候選
                 continue
-            tracks[next_track_id] = Track(id=next_track_id, center=c, last_seen=now, hold_start=now)
+            tracks[next_track_id] = Track(id=next_track_id, center=c, last_seen=now, hold_start=now) # 為此未配對的候選建立新 Track
             next_track_id += 1
 
-        to_del = []
-        for tid, tr in tracks.items():
-            if tid in assigned_t:
+        # 移除離開的人（貓隨之消失）
+        to_del = [] # 先準備一個待刪清單，避免邊迭代字典邊刪除造成錯誤
+        for tid, tr in tracks.items(): # 逐一檢查所有 tracks
+            if tid in assigned_t: # 本幀有成功匹配到（仍在畫面）的 track 直接跳過，不刪
                 continue
-            if now - tr.last_seen > args.miss_timeout:
+            if now - tr.last_seen > args.miss_timeout: # 若這個人已一段時間沒被看到（超過 miss_timeout 秒），視為離場，把 tid 加入待刪清單
                 to_del.append(tid)
-        for tid in to_del:
+        for tid in to_del: # 迴圈後再統一刪除
             tracks.pop(tid, None)
 
-        ripples = [rp for rp in ripples if rp.alive(now)]
+        # 套用「影片風格水波」
+        ripples = [rp for rp in ripples if rp.alive(now)] # 透過 alive(now) 篩選還在生命期內的 Ripple，把已經衰減到看不見的波紋移除，避免白跑運算、提升每幀效能與穩定度
+        # 將剩下的活躍波紋一次套用到 canvas：
+        # 函式會依各個 ripple 的中心、波長、速度、幅度與衰減，建立像素位移場並用 cv2.remap 做折射變形（也含波峰高光），所以可以同時呈現多圈/多個來源的水波效果
         apply_ripples_refraction(canvas, ripples, now)
 
+        # 骨架（可選）
         if args.draw_skeleton:
             draw_skeletons(canvas, kxy, kcf, lw=args.line_width)
 
-        for tid, tr in tracks.items():
-            if tr.cat is None:
+        # 更新與繪製貓圖（旋轉 + 沿圓邊跟隨）
+        for tid, tr in tracks.items(): # 逐一處理所有追蹤到的人（track）
+            if tr.cat is None: # 沒有被指派貓圖的（尚未觸發）跳過
                 continue
-            nx, ny = tr.center
-            px, py = nearest_point_on_circle(center, radius - 6, (nx, ny))
-            a = float(np.clip(args.follow_smooth, 0.0, 1.0))
+            nx, ny = tr.center # 取這個人的代表點（鼻子）座標
+            px, py = nearest_point_on_circle(center, radius - 6, (nx, ny)) # 把鼻子投影到圓形視窗邊框內縮 6px的位置，得到「沿圓邊的目標點」
+            a = float(np.clip(args.follow_smooth, 0.0, 1.0)) # 跟隨的平滑係數（0～1）：越大越「跟緊」，越小越「平順不抖」
+            # 對貓圖中心做線性內插（EMA/lerp）朝目標點移動，避免瞬移與抖動。
             tr.cat.cx = tr.cat.cx * (1 - a) + px * a
             tr.cat.cy = tr.cat.cy * (1 - a) + py * a
+            # 依貓當前圓邊位置算出切線角度（必要時加 --rot_offset 微調），確保貓的朝向沿著圓周
             tr.cat.rot_deg = tangent_angle_deg(center, (int(tr.cat.cx), int(tr.cat.cy)), clockwise=True, offset_deg=args.rot_offset)
+            # 以保留 Alpha 的方式旋轉貓圖，避免黑邊/鋸齒
             rotated = rotate_with_alpha(tr.cat.base, tr.cat.rot_deg)
+            # 把旋轉後的貓圖以像素級 Alpha 混合貼到畫面中央座標 (cx, cy)；tr.cat.alpha(now) 會在淡入期間由 0→1，產生平滑浮現效果
             overlay_bgra_center(canvas, rotated, int(round(tr.cat.cx)), int(round(tr.cat.cy)), tr.cat.alpha(now))
 
+        # 圓形遮罩 + 邊框
+        # 產生一張單通道遮罩（uint8）：圓內像素=255，圓外=0；center 與 radius 是先前算好的圓心與半徑
         mask = create_circular_mask(h, w, center=center, radius=radius)
+        # 用遮罩把 canvas 做位元與運算：圓內保留原影像，圓外被清成黑色，等於把畫面裁成圓形視窗
         masked = cv2.bitwise_and(canvas, canvas, mask=mask)
+        # 在結果影像上沿圓周畫一圈白色實線（粗細=3），當作造型邊框，也讓圓邊界更清楚
         cv2.circle(masked, center, radius, (255, 255, 255), 3)
 
+        # FPS
         dt = now - prev_t; prev_t = now
         if dt > 0: fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else 1.0 / dt
         cv2.putText(masked, f"FPS:{fps:.1f} Ripples:{len(ripples)} Tracks:{len(tracks)}", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
