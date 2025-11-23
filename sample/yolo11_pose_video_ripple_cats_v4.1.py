@@ -102,34 +102,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--weights", type=str, default="yolo11n-pose.pt")
     p.add_argument("--imgsz", type=int, default=640)
-    p.add_argument("--width", type=int, default=1280)
+    p.add_argument("--width", type=int, default=1280) # 遊戲畫面輸出尺寸（先把背景影像等比裁到這個大小，再套圓形遮罩）
     p.add_argument("--height", type=int, default=720)
-    p.add_argument("--circle_ratio", type=float, default=0.95)
-    p.add_argument("--conf", type=float, default=0.25)
-    p.add_argument("--draw_skeleton", action="store_true")
-    p.add_argument("--line_width", type=int, default=2)
+    p.add_argument("--circle_ratio", type=float, default=0.95) # 圓形視窗直徑占短邊的比例（0–1），決定圓的大小
+    p.add_argument("--conf", type=float, default=0.4) # 關鍵點偵測信心門檻（過低易誤檢，過高易漏檢）
+    p.add_argument("--draw_skeleton", action="store_true") # 是否把骨架疊在畫面上
+    p.add_argument("--line_width", type=int, default=2) # 骨架線與點的粗細
 
     # 背景與貓
-    p.add_argument("--bg_video", type=str, default="./calm_water.mp4")
-    p.add_argument("--cats", type=str, default="./cat0.png,./cat1.png,./cat2.png,./cat3.png,./cat4.png")
-    p.add_argument("--cat_fade", type=float, default=3.0)
-    p.add_argument("--cat_size_ratio", type=float, default=0.25)
-    p.add_argument("--follow_smooth", type=float, default=0.18)
-    p.add_argument("--rot_offset", type=float, default=30.0)
+    p.add_argument("--bg_video", type=str, default="./calm_water.mp4") # 背景 mp4 檔路徑
+    p.add_argument("--cats", type=str, default="./cat0.png,./cat1.png,./cat2.png,./cat3.png,./cat4.png") # 以逗號分隔的貓圖清單（支援自動搜尋 cat*.png/jpg）
+    p.add_argument("--cat_fade", type=float, default=3.0) # 貓圖淡入時間（秒）
+    p.add_argument("--cat_size_ratio", type=float, default=0.25) # 貓圖顯示尺寸＝原圖大小的比例（例：0.25=25%）
+    p.add_argument("--follow_smooth", type=float, default=0.18) # 沿圓邊跟隨的平滑係數（0–1，越大越跟緊、越小越穩定）
+    p.add_argument("--rot_offset", type=float, default=30.0) # 在切線方向基礎上再加的旋轉角（度），用來做造型校正
 
     # 觸發／追蹤
-    p.add_argument("--face_hold_sec", type=float, default=3.0)
-    p.add_argument("--trigger_cooldown", type=float, default=3.0)
-    p.add_argument("--match_thresh", type=float, default=100.0)
-    p.add_argument("--miss_timeout", type=float, default=1.5)
+    p.add_argument("--face_hold_sec", type=float, default=3.0) # 需連續偵測到同一人的鼻/雙眼/雙耳滿這麼多秒才觸發
+    p.add_argument("--trigger_cooldown", type=float, default=3.0) # 全域冷卻秒數，避免短時間內多次觸發
+    p.add_argument("--match_thresh", type=float, default=100.0) # 多人追蹤時，舊 track 與本幀鼻子點的最大匹配距離（像素）
+    p.add_argument("--miss_timeout", type=float, default=1.5) # 超過這段時間沒再看到此人就視為離場（將其 track 與貓移除）
 
     # 水波（影片風格）
-    p.add_argument("--ripple_lambda", type=float, default=24.0)
-    p.add_argument("--ripple_speed", type=float, default=180.0)
-    p.add_argument("--ripple_amp", type=float, default=6.0)
-    p.add_argument("--ripple_radial_decay", type=float, default=0.015)
-    p.add_argument("--ripple_time_tau", type=float, default=1.6)
-    p.add_argument("--ripple_highlight", type=float, default=0.22)
+    p.add_argument("--ripple_lambda", type=float, default=24.0) # 波長（像素）—波紋之間的間距
+    p.add_argument("--ripple_speed", type=float, default=180.0) # 向外擴散速度（像素/秒）
+    p.add_argument("--ripple_amp", type=float, default=6.0) # 折射位移幅度（像素）—扭曲強度
+    p.add_argument("--ripple_radial_decay", type=float, default=0.015) # 徑向衰減係數（越大越快隨半徑衰減）
+    p.add_argument("--ripple_time_tau", type=float, default=1.6) # 時間衰減常數 τ（秒）—波存活時間尺度
+    p.add_argument("--ripple_highlight", type=float, default=0.22) # 波峰高光強度（0–1），模擬反光閃爍
     return p.parse_args()
 
 # ----------------- 共用工具 -----------------

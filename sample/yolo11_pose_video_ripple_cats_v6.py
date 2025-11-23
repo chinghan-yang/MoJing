@@ -1,18 +1,18 @@
 """
-YOLO11 Pose 視訊背景＋條件觸發水波＆貓咪淡入（修改版）
+YOLO11 Pose 視訊背景＋影片素材水波＋貓咪淡入（繼承機制版）
 Python 3.11
 
 修改重點：
-1. 水波中心固定在畫面原點（圓心），不再跟隨人臉位置。
-2. 觸發條件新增限制：只有在「場上沒有任何貓咪」時，才能觸發新特效。
-3. 關鍵點偵測條件更嚴格：除五官外，新增左右肩膀（共7點）都必須偵測到。
+1. 水波播放結束時，若原始觸發者已離開，會自動尋找場上其他目標（模擬「人回到畫面」的情況）。
+2. 若水波結束時場上無人，則不生成貓咪（避免虛空貓）。
+3. 繼承機制：新的目標會直接獲得貓咪，無需重新等待觸發。
 
 執行示例：
-  python yolo11_pose_video_ripple_cats_v5_mod.py \
+  python yolo11_pose_video_ripple_movie_handover.py \
     --bg_video ./calm_water.mp4 \
+    --ripple_video ./Ripple.mp4 \
     --cats ./cat0.png,./cat1.png,./cat2.png,./cat3.png,./cat4.png \
     --cat_size_ratio 0.25 --cat_fade 3.0 --follow_smooth 0.18 \
-    --ripple_lambda 24 --ripple_speed 180 --ripple_amp 6 --ripple_radial_decay 0.015 --ripple_time_tau 1.6 --ripple_highlight 0.22 \
     --camera 0 --weights yolo11n-pose.pt --draw_skeleton
 """
 from __future__ import annotations
@@ -28,7 +28,6 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-# [修改點 3] 新增左右肩膀偵測
 # COCO 17 關鍵點：0鼻, 1左眼, 2右眼, 3左耳, 4右耳, 5左肩, 6右肩
 FACE_IDXS = [0, 1, 2, 3, 4, 5, 6]
 
@@ -45,22 +44,12 @@ COCO_EDGES = [
     (1, 3), (2, 4)     # 眼-耳
 ]
 
-# ----------------- 水波（影片風格）資料結構 -----------------
+# ----------------- 獨立水波管理 -----------------
 @dataclass
-class Ripple:
-    x: float
-    y: float
-    start: float
-    wavelength: float
-    speed: float
-    amp: float
-    radial_decay: float
-    time_tau: float
-    highlight: float
-
-    def alive(self, now: float) -> bool:
-        t = now - self.start
-        return t < (self.time_tau * 5.0)
+class ActiveRipple:
+    """獨立管理水波播放"""
+    frame_idx: int = 0
+    owner_track_id: int = -1  # 紀錄原始觸發者 ID
 
 # ----------------- 貓圖與追蹤 -----------------
 @dataclass
@@ -71,6 +60,7 @@ class CatOverlay:
     cx: float = 0.0
     cy: float = 0.0
     rot_deg: float = 0.0
+
     def alpha(self, now: float) -> float:
         a = (now - self.start) / max(1e-6, self.duration)
         return float(np.clip(a, 0.0, 1.0))
@@ -87,7 +77,7 @@ class Track:
 # ----------------- 參數 -----------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="YOLO11 Pose｜修改版：固定波心、無貓才觸發、含肩膀偵測")
+    p = argparse.ArgumentParser(description="YOLO11 Pose｜影片水波繼承版")
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--weights", type=str, default="yolo11n-pose.pt")
     p.add_argument("--imgsz", type=int, default=640)
@@ -98,8 +88,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--draw_skeleton", action="store_true")
     p.add_argument("--line_width", type=int, default=2)
 
-    # 背景與貓
+    # 背景、水波影片與貓
     p.add_argument("--bg_video", type=str, default="./calm_water.mp4")
+    p.add_argument("--ripple_video", type=str, default="./Ripple.mp4", help="水波特效影片路徑")
     p.add_argument("--cats", type=str, default="./cat0.png,./cat1.png,./cat2.png,./cat3.png,./cat4.png")
     p.add_argument("--cat_fade", type=float, default=3.0)
     p.add_argument("--cat_size_ratio", type=float, default=0.25)
@@ -112,16 +103,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--match_thresh", type=float, default=100.0)
     p.add_argument("--miss_timeout", type=float, default=1.5)
 
-    # 水波（影片風格）
-    p.add_argument("--ripple_lambda", type=float, default=48.0)
-    p.add_argument("--ripple_speed", type=float, default=120.0)
-    p.add_argument("--ripple_amp", type=float, default=6.0)
-    p.add_argument("--ripple_radial_decay", type=float, default=0.005)
-    p.add_argument("--ripple_time_tau", type=float, default=2.5)
-    p.add_argument("--ripple_highlight", type=float, default=0.5)
     return p.parse_args()
 
-# ----------------- 共用工具 -----------------
+# ----------------- 工具函式 -----------------
+
+def load_video_frames(path: str, width: int, height: int) -> List[np.ndarray]:
+    frames = []
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        print(f"Warning: 無法開啟水波影片 {path}，將不會顯示水波特效。")
+        return []
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+        frames.append(resized)
+
+    cap.release()
+    print(f"已載入水波影片: {len(frames)} 幀")
+    return frames
 
 def create_circular_mask(h: int, w: int, center: Tuple[int, int] | None = None, radius: int | None = None) -> np.ndarray:
     if center is None:
@@ -131,7 +133,6 @@ def create_circular_mask(h: int, w: int, center: Tuple[int, int] | None = None, 
     Y, X = np.ogrid[:h, :w]
     return (((X - center[0]) ** 2 + (Y - center[1]) ** 2) <= radius ** 2).astype(np.uint8) * 255
 
-
 def resize_fit(image: np.ndarray, width: int, height: int) -> np.ndarray:
     ih, iw = image.shape[:2]
     scale = max(width / iw, height / ih)
@@ -140,7 +141,6 @@ def resize_fit(image: np.ndarray, width: int, height: int) -> np.ndarray:
     x0 = (nw - width) // 2
     y0 = (nh - height) // 2
     return resized[y0:y0 + height, x0:x0 + width]
-
 
 def extract_kpts(result) -> Tuple[np.ndarray, np.ndarray]:
     if not hasattr(result, "keypoints") or result.keypoints is None:
@@ -153,7 +153,6 @@ def extract_kpts(result) -> Tuple[np.ndarray, np.ndarray]:
     else:
         kconf = conf.cpu().numpy() if hasattr(conf, "cpu") else np.asarray(conf)
     return xy.astype(np.float32), kconf.astype(np.float32)
-
 
 def draw_skeletons(canvas: np.ndarray, kpts_xy: np.ndarray, kpts_conf: np.ndarray, lw: int = 2):
     if kpts_xy.size == 0:
@@ -173,8 +172,6 @@ def draw_skeletons(canvas: np.ndarray, kpts_xy: np.ndarray, kpts_conf: np.ndarra
                 cv2.circle(overlay, p, max(1, lw), (255, 255, 255), -1, cv2.LINE_AA)
     cv2.addWeighted(overlay, 0.7, canvas, 0.3, 0, dst=canvas)
 
-# ---------- 旋轉與貼圖（支援 BGRA Alpha） ----------
-
 def ensure_bgra(img: np.ndarray) -> np.ndarray:
     if img.ndim == 3 and img.shape[2] == 4:
         return img
@@ -182,7 +179,6 @@ def ensure_bgra(img: np.ndarray) -> np.ndarray:
         a = np.full((img.shape[0], img.shape[1], 1), 255, dtype=np.uint8)
         return np.concatenate([img, a], axis=2)
     raise ValueError("Invalid image shape for BGRA conversion")
-
 
 def rotate_with_alpha(bgra: np.ndarray, angle_deg: float, scale: float = 1.0) -> np.ndarray:
     bgra = ensure_bgra(bgra)
@@ -196,7 +192,6 @@ def rotate_with_alpha(bgra: np.ndarray, angle_deg: float, scale: float = 1.0) ->
     M[1, 2] += (nh / 2) - c[1]
     rotated = cv2.warpAffine(bgra, M, (nw, nh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
     return rotated
-
 
 def overlay_bgra_center(canvas: np.ndarray, bgra: np.ndarray, cx: int, cy: int, alpha_scale: float):
     if alpha_scale <= 0.0:
@@ -215,8 +210,6 @@ def overlay_bgra_center(canvas: np.ndarray, bgra: np.ndarray, cx: int, cy: int, 
     out = bgr * a + roi.astype(np.float32) * (1.0 - a)
     canvas[y1:y2, x1:x2] = np.clip(out, 0, 255).astype(np.uint8)
 
-# ---------- 幾何工具 ----------
-
 def nearest_point_on_circle(center: Tuple[int, int], radius: int, p: Tuple[float, float]) -> Tuple[int, int]:
     cx, cy = center
     vx, vy = p[0] - cx, p[1] - cy
@@ -228,7 +221,6 @@ def nearest_point_on_circle(center: Tuple[int, int], radius: int, p: Tuple[float
     py = int(round(cy + uy * radius))
     return px, py
 
-
 def tangent_angle_deg(center: Tuple[int, int], p: Tuple[int, int], clockwise: bool = True, offset_deg: float = 0.0) -> float:
     cx, cy = center
     rx, ry = p[0] - cx, p[1] - cy
@@ -239,54 +231,6 @@ def tangent_angle_deg(center: Tuple[int, int], p: Tuple[int, int], clockwise: bo
     angle = np.degrees(np.arctan2(ty, tx))
     return float(angle + offset_deg)
 
-# ---------- 水波（影片風格）核心：區域折射位移 ----------
-
-def apply_ripples_refraction(canvas: np.ndarray, ripples: List[Ripple], now: float):
-    if not ripples:
-        return
-    H, W = canvas.shape[:2]
-    src = canvas.copy()
-
-    for rp in ripples:
-        if not rp.alive(now):
-            continue
-        t = now - rp.start
-        R = int(min(max(rp.speed * t + 3 * rp.wavelength, rp.wavelength * 2), max(H, W)))
-        x0 = max(0, int(rp.x - R)); y0 = max(0, int(rp.y - R))
-        x1 = min(W, int(rp.x + R)); y1 = min(H, int(rp.y + R))
-        if x1 - x0 <= 2 or y1 - y0 <= 2:
-            continue
-
-        roi = src[y0:y1, x0:x1]
-        h, w = roi.shape[:2]
-        xs = np.arange(w, dtype=np.float32); ys = np.arange(h, dtype=np.float32)
-        X, Y = np.meshgrid(xs, ys)
-        dx = X + x0 - rp.x
-        dy = Y + y0 - rp.y
-        r = np.sqrt(dx * dx + dy * dy) + 1e-6
-
-        k = 2.0 * np.pi / rp.wavelength
-        phase = k * (r - rp.speed * t)
-        decay = np.exp(-rp.radial_decay * r) * np.exp(-t / rp.time_tau)
-        disp = (rp.amp * np.sin(phase) * decay).astype(np.float32)
-        ux = (dx / r).astype(np.float32); uy = (dy / r).astype(np.float32)
-
-        map_x = (X + disp * ux).astype(np.float32)
-        map_y = (Y + disp * uy).astype(np.float32)
-
-        distorted = cv2.remap(roi, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-
-        if rp.highlight > 1e-3:
-            crest = (np.cos(phase) * 0.5 + 0.5) ** 6
-            crest *= decay
-            crest = np.clip(crest * rp.highlight, 0.0, 1.0).astype(np.float32)
-            hl = (crest[..., None] * 255.0).astype(np.uint8)
-            yuv = cv2.cvtColor(distorted, cv2.COLOR_BGR2YUV)
-            yuv[:, :, 0] = np.clip(yuv[:, :, 0].astype(np.int32) + (hl[:, :, 0] // 6), 0, 255).astype(np.uint8)
-            distorted = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
-
-        canvas[y0:y1, x0:x1] = distorted
-
 # ----------------- 主流程 -----------------
 
 def main():
@@ -295,6 +239,8 @@ def main():
     bgcap = cv2.VideoCapture(args.bg_video)
     if not bgcap.isOpened():
         raise FileNotFoundError(f"無法開啟背景影片：{args.bg_video}")
+
+    ripple_frames = load_video_frames(args.ripple_video, args.width, args.height)
 
     cam = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW) if cv2.getBuildInformation().find("MSVC") != -1 else cv2.VideoCapture(args.camera)
     cam.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -332,12 +278,13 @@ def main():
     cats_loaded = len(raw_cats)
 
     prev_t = time.time(); fps = 0.0
-    ripples: List[Ripple] = []
     next_track_id = 1
     tracks: Dict[int, Track] = {}
+
+    running_ripples: List[ActiveRipple] = []
     last_global_trigger: float = 0.0
 
-    win_name = "Video BG + Pose Ripples + Cats (Mod V5)"
+    win_name = "Video BG + Ripple Movie (Handover) + Cats"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -367,7 +314,6 @@ def main():
         centers: List[Tuple[float, float]] = []
         for i in range(kxy.shape[0]):
             cf = kcf[i]
-            # [修改點 3] 判斷條件改為 FACE_IDXS (現在包含肩膀)
             if all(cf[idx] > 0.25 for idx in FACE_IDXS):
                 centers.append((float(kxy[i, 0, 0]), float(kxy[i, 0, 1])))
 
@@ -391,35 +337,70 @@ def main():
             if tr.hold_start is None:
                 tr.hold_start = now
 
-            # [修改點 2] 檢查場上是否有任何貓咪 (任意 Track 的 cat 不為 None)
+            # ----------------- 邏輯核心 -----------------
             cats_on_screen = any(t.cat is not None for t in tracks.values())
+            ripples_active = len(running_ripples) > 0
 
+            # 觸發條件
             if (not tr.triggered) and \
                (now - tr.hold_start >= args.face_hold_sec) and \
                (now - last_global_trigger >= args.trigger_cooldown) and \
-               (not cats_on_screen):  # 只有當場上沒貓時才觸發
+               (not cats_on_screen) and (not ripples_active):
 
-                nx, ny = tr.center # 仍然需要鼻子的位置來算貓的生成位置
-                nx_clip = int(np.clip(nx, 0, w - 1))
-                ny_clip = int(np.clip(ny, 0, h - 1))
-
-                # [修改點 1] 水波生成位置強制設為畫面中心 (center[0], center[1])
-                ripples.append(Ripple(x=center[0], y=center[1], start=now,
-                                      wavelength=args.ripple_lambda,
-                                      speed=args.ripple_speed,
-                                      amp=args.ripple_amp,
-                                      radial_decay=args.ripple_radial_decay,
-                                      time_tau=args.ripple_time_tau,
-                                      highlight=args.ripple_highlight))
-
-                last_global_trigger = now
+                print(f"Track {tr.id} Triggered! Spawning Independent Ripple...")
                 tr.triggered = True
-                if cats_loaded > 0:
-                    cat_raw = random.choice(raw_cats)
-                    px, py = nearest_point_on_circle(center, radius - 6, (nx_clip, ny_clip))
-                    rot = tangent_angle_deg(center, (px, py), clockwise=True, offset_deg=args.rot_offset)
-                    tr.cat = CatOverlay(base=cat_raw, start=now, duration=max(0.5, args.cat_fade), cx=float(px), cy=float(py), rot_deg=rot)
+                last_global_trigger = now
 
+                if len(ripple_frames) > 0:
+                    running_ripples.append(ActiveRipple(frame_idx=0, owner_track_id=tr.id))
+                else:
+                    if cats_loaded > 0:
+                        nx, ny = tr.center
+                        px, py = nearest_point_on_circle(center, radius - 6, (nx, ny))
+                        rot = tangent_angle_deg(center, (px, py), clockwise=True, offset_deg=args.rot_offset)
+                        tr.cat = CatOverlay(base=random.choice(raw_cats), start=now, duration=args.cat_fade, cx=float(px), cy=float(py), rot_deg=rot)
+
+        # ----------------- 繪製水波 (獨立於 Track 迴圈) -----------------
+        finished_ripples = []
+        for rp in running_ripples:
+            if rp.frame_idx < len(ripple_frames):
+                cv2.add(canvas, ripple_frames[rp.frame_idx], dst=canvas)
+                rp.frame_idx += 1
+            else:
+                finished_ripples.append(rp)
+
+        # ----------------- [核心修改] 處理水波結束 -> 繼承與生成 -----------------
+        for rp in finished_ripples:
+            running_ripples.remove(rp)
+            print(f"Ripple finished. Checking for target...")
+
+            target_track: Optional[Track] = None
+
+            # 1. 優先檢查原始觸發者
+            if rp.owner_track_id in tracks:
+                target_track = tracks[rp.owner_track_id]
+                print(f" -> Original owner (ID {rp.owner_track_id}) found.")
+
+            # 2. 若原始觸發者消失，檢查場上是否有其他無貓的目標 (繼承機制)
+            else:
+                # 尋找還沒有貓咪的 Track
+                candidates = [t for t in tracks.values() if t.cat is None]
+                if candidates:
+                    target_track = candidates[0] # 取第一個找到的
+                    # 將觸發狀態同步給這位幸運兒，避免他立刻又觸發一次水波
+                    target_track.triggered = True
+                    print(f" -> Owner lost. Handing over cat to new Track ID {target_track.id}.")
+                else:
+                    print(" -> No one on screen. No cat spawned.")
+
+            # 3. 若有目標，執行生成
+            if target_track is not None and cats_loaded > 0:
+                nx, ny = target_track.center
+                px, py = nearest_point_on_circle(center, radius - 6, (nx, ny))
+                rot = tangent_angle_deg(center, (px, py), clockwise=True, offset_deg=args.rot_offset)
+                target_track.cat = CatOverlay(base=random.choice(raw_cats), start=now, duration=args.cat_fade, cx=float(px), cy=float(py), rot_deg=rot)
+
+        # 新增與刪除 Track
         for j, c in enumerate(centers):
             if j in assigned_c:
                 continue
@@ -434,9 +415,6 @@ def main():
                 to_del.append(tid)
         for tid in to_del:
             tracks.pop(tid, None)
-
-        ripples = [rp for rp in ripples if rp.alive(now)]
-        apply_ripples_refraction(canvas, ripples, now)
 
         if args.draw_skeleton:
             draw_skeletons(canvas, kxy, kcf, lw=args.line_width)
@@ -459,7 +437,7 @@ def main():
 
         dt = now - prev_t; prev_t = now
         if dt > 0: fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else 1.0 / dt
-        cv2.putText(masked, f"FPS:{fps:.1f} Ripples:{len(ripples)} Tracks:{len(tracks)}", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(masked, f"FPS:{fps:.1f} Ripples:{len(running_ripples)} Tracks:{len(tracks)}", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
         cv2.imshow(win_name, masked)
         if (cv2.waitKey(1) & 0xFF) == ord('q'):
