@@ -1,18 +1,18 @@
 """
-YOLO11 Pose 視訊背景＋影片素材水波＋貓咪淡入（旋轉角度修正版）
+YOLO11 Pose 視訊背景＋影片素材水波＋貓咪淡入（後進者免水波版）
 Python 3.11
 
-修復重點：
-1. [修正] 旋轉角度公式：改為 `90 - body_angle`。
-   解決水平移動時貓頭朝外(身體在圈內)的錯誤，同時保持垂直時的正確性。
+需求調整：
+1. [新增] 邏輯判斷：若場上已有貓咪，新觸發者「只生成貓咪，不播水波」。
+2. [保留] 鏡像翻轉、角度修正 (90-angle)、放寬偵測條件、多人同時體驗。
 
 執行示例：
-  python yolo11_pose_angle_fix.py \
+  python yolo11_pose_no_ripple_if_cat.py \
     --bg_video ./calm_water.mp4 \
     --ripple_video ./Ripple.mp4 \
     --cats ./cat0.png,./cat1.png,./cat2.png,./cat3.png,./cat4.png \
     --cat_size_ratio 0.25 --cat_fade 3.0 --follow_smooth 0.15 \
-    --camera 0 --weights yolo11n-pose.pt --draw_skeleton --debug_angle
+    --camera 0 --weights yolo11n-pose.pt --debug_angle
 """
 from __future__ import annotations
 import argparse
@@ -70,7 +70,7 @@ class Track:
 
 # ----------------- 參數 -----------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="YOLO11 Pose｜角度修正版")
+    p = argparse.ArgumentParser(description="YOLO11 Pose｜後進者免水波版")
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--weights", type=str, default="yolo11n-pose.pt")
     p.add_argument("--imgsz", type=int, default=640)
@@ -244,7 +244,7 @@ def main():
     running_ripples: List[ActiveRipple] = []
     last_global_trigger = 0.0
 
-    win_name = "Video BG + Fixed Angle"
+    win_name = "Video BG + No Ripple If Cat Exists"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -268,7 +268,7 @@ def main():
         detected_poses = []
         for i in range(kxy.shape[0]):
             cf = kcf[i]
-            # 條件放寬：基礎點(鼻,肩) + 任意一側臉
+            # 條件放寬：鼻+肩 + 單側臉
             has_basic = (cf[0] > 0.25) and (cf[5] > 0.25) and (cf[6] > 0.25)
             has_left_face = (cf[1] > 0.25) and (cf[3] > 0.25)
             has_right_face = (cf[2] > 0.25) and (cf[4] > 0.25)
@@ -297,17 +297,22 @@ def main():
             assigned_t.add(tid); assigned_c.add(j)
 
             tr = tracks[tid]
-            has_cat = any(t.cat is not None for t in tracks.values())
-            is_rippling = len(running_ripples) > 0
 
             if not tr.triggered and \
                (now - tr.hold_start >= args.face_hold_sec) and \
-               (now - last_global_trigger >= args.trigger_cooldown) and \
-               not has_cat and not is_rippling:
+               (now - last_global_trigger >= args.trigger_cooldown):
 
                 tr.triggered = True
                 last_global_trigger = now
-                if ripple_frames: running_ripples.append(ActiveRipple(0, tr.id))
+
+                # [修改重點] 判斷場上是否已經有貓
+                cats_on_screen = any(t.cat is not None for t in tracks.values())
+
+                # 若無貓，且有水波資源 -> 播水波 (之後在 finished 區塊生成貓)
+                if ripple_frames and not cats_on_screen:
+                    running_ripples.append(ActiveRipple(0, tr.id))
+
+                # 若已有貓 (或無水波資源) -> 直接生成貓咪
                 elif cats_loaded:
                     vec = (tr.pose.shoulder_center[0]-tr.pose.nose[0], tr.pose.shoulder_center[1]-tr.pose.nose[1])
                     px, py = get_ray_circle_intersection(center, radius, tr.pose.nose, vec)
@@ -320,6 +325,7 @@ def main():
 
         tracks = {tid: tr for tid, tr in tracks.items() if now - tr.last_seen <= args.miss_timeout}
 
+        # 繪製水波
         finished = []
         for rp in running_ripples:
             if rp.frame_idx < len(ripple_frames):
@@ -327,6 +333,7 @@ def main():
                 rp.frame_idx += 1
             else: finished.append(rp)
 
+        # 水波結束後生成貓 (僅針對有播水波的 Track)
         for rp in finished:
             running_ripples.remove(rp)
             target = tracks.get(rp.owner_track_id)
@@ -354,7 +361,6 @@ def main():
             tr.cat.cx = tr.cat.cx * (1 - alpha) + target_x * alpha
             tr.cat.cy = tr.cat.cy * (1 - alpha) + target_y * alpha
 
-            # [修正點] 角度計算改為 90 - body_angle
             body_angle = math.degrees(math.atan2(vec_y, vec_x))
             tr.cat.rot_deg = 90 - body_angle + args.rot_offset
 
@@ -372,7 +378,7 @@ def main():
 
         dt = now - prev_t; prev_t = now
         fps = 0.9 * fps + 0.1 * (1/dt) if dt > 0 else 0
-        cv2.putText(masked, f"FPS:{fps:.1f}", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+        cv2.putText(masked, f"FPS:{fps:.1f} Users:{len(tracks)}", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
         cv2.imshow(win_name, masked)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
