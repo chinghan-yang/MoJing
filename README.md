@@ -9,6 +9,6 @@ python yolo11_pose_video_ripple_cats_v5.py --bg_video ./calm_water.mp4 --cats ./
 
 
 ```shell
-python yolo11_pose_video_ripple_cats_v7.py --bg_video ./calm_water.mp4 --cats ./cat0.png,./cat1.png,./cat2.png,./cat3.png,./cat4.png --camera 0 --weights yolo11n-pose.pt --draw_skeleton --debug_angle
+python yolo11_pose_video_ripple_cats_v8.py --bg_video ./calm_water.mp4 --cats ./cat0.png,./cat1.png,./cat2.png,./cat3.png,./cat4.png --camera 0 --weights yolo11n-pose.pt --draw_skeleton
 
 ```
