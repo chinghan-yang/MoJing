@@ -26,8 +26,8 @@ RECORD_DIR = Path("../recordings")    # 錄影輸出資料夾
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="OpenCV live preview (1920x1080) with recording")
-    p.add_argument("--cam", "--camera-index", type=int, default=2, dest="cam_index",
-                   help="Camera index (default: 2, same as original file)")
+    p.add_argument("--cam", "--camera-index", type=int, default=0, dest="cam_index",
+                   help="Camera index (default: 0, same as original file)")
     p.add_argument("--width", type=int, default=1920, help="Try to set camera capture width (default: 1920)")
     p.add_argument("--height", type=int, default=1080, help="Try to set camera capture height (default: 1080)")
     p.add_argument("--fps", type=float, default=0.0,

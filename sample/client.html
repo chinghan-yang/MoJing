@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YOLOv11 Pose WebSocket Client</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f0f2f5;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h2 { color: #333; }
+
+        .container {
+            display: flex;
+            gap: 20px;
+            width: 100%;
+            max-width: 1200px;
+        }
+
+        .visualizer {
+            flex: 2;
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        canvas {
+            background-color: #000; /* 黑色背景模擬影片視窗 */
+            border-radius: 4px;
+            max-width: 100%;
+        }
+
+        .data-panel {
+            flex: 1;
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            height: 500px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #json-output {
+            background-color: #2d2d2d;
+            color: #76d9e6;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-y: auto;
+            flex-grow: 1;
+            font-family: monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+
+        .status {
+            margin-bottom: 10px;
+            padding: 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            text-align: center;
+        }
+        .connected { background-color: #d4edda; color: #155724; }
+        .disconnected { background-color: #f8d7da; color: #721c24; }
+    </style>
+</head>
+<body>
+
+    <h2>YOLOv11 骨架偵測即時串流</h2>
+
+    <div class="container">
+        <div class="visualizer">
+            <div id="status" class="status disconnected">未連線</div>
+            <canvas id="poseCanvas" width="1920" height="1080"></canvas>
+            <p>即時骨架重繪 (Canvas)</p>
+        </div>
+
+        <div class="data-panel">
+            <h3>接收到的 JSON 資料</h3>
+            <div id="json-output">等待資料中...</div>
+        </div>
+    </div>
+
+    <script>
+        // --- 設定 ---
+        const WS_URL = "ws://localhost:8765";
+        const CONFIDENCE_THRESHOLD = 0.5; // 繪圖的信心門檻
+
+        // --- DOM 元素 ---
+        const canvas = document.getElementById('poseCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+        const jsonOutput = document.getElementById('json-output');
+
+        // --- YOLO Pose 骨架連線定義 (COCO Keypoints 索引) ---
+        // 格式: [起點索引, 終點索引, 顏色]
+        const SKELETON_CONNECTIONS = [
+            [5, 7, '#FF0000'], [7, 9, '#FF0000'],   // 左手 (紅)
+            [6, 8, '#00FF00'], [8, 10, '#00FF00'],  // 右手 (綠)
+            [11, 13, '#FF0000'], [13, 15, '#FF0000'], // 左腿 (紅)
+            [12, 14, '#00FF00'], [14, 16, '#00FF00'], // 右腿 (綠)
+            [5, 6, '#FFFF00'], [11, 12, '#FFFF00'], // 肩膀與臀部連接 (黃)
+            [5, 11, '#FFFF00'], [6, 12, '#FFFF00'], // 軀幹 (黃)
+            [0, 1, '#00FFFF'], [0, 2, '#00FFFF'],   // 臉部 (青)
+            [1, 3, '#00FFFF'], [2, 4, '#00FFFF']
+        ];
+
+        // --- WebSocket 邏輯 ---
+        let ws;
+
+        function connect() {
+            ws = new WebSocket(WS_URL);
+
+            ws.onopen = () => {
+                statusDiv.innerText = "已連線至 WebSocket Server";
+                statusDiv.className = "status connected";
+                console.log("Connected to WS");
+            };
+
+            ws.onclose = () => {
+                statusDiv.innerText = "連線中斷，3秒後重試...";
+                statusDiv.className = "status disconnected";
+                setTimeout(connect, 3000);
+            };
+
+            ws.onerror = (err) => {
+                console.error("WS Error:", err);
+                ws.close();
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+
+                    // 1. 顯示原始 JSON (為了效能，只顯示前 500 個字元或是完整顯示)
+                    // 這裡我們格式化顯示
+                    jsonOutput.innerText = JSON.stringify(data, null, 2);
+
+                    // 2. 繪製骨架
+                    drawPose(data);
+
+                } catch (e) {
+                    console.error("Parsing error:", e);
+                }
+            };
+        }
+
+        // --- 繪圖邏輯 ---
+        function drawPose(data) {
+            // 清除畫布
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 取得 Frame ID (因為 JSON 結構是 { "frame_id": [...] })
+            const frameId = Object.keys(data)[0];
+            const people = data[frameId];
+
+            if (!people || people.length === 0) return;
+
+            people.forEach(person => {
+                // person 是一個包含 17 個點的陣列: [[x, y, conf], [x, y, conf], ...]
+
+                // 1. 繪製連線 (Limbs)
+                SKELETON_CONNECTIONS.forEach(([startIdx, endIdx, color]) => {
+                    const startPt = person[startIdx];
+                    const endPt = person[endIdx];
+
+                    // 檢查信心度
+                    if (startPt[2] > CONFIDENCE_THRESHOLD && endPt[2] > CONFIDENCE_THRESHOLD) {
+                        drawLine(startPt, endPt, color);
+                    }
+                });
+
+                // 2. 繪製關鍵點 (Joints)
+                person.forEach((point, index) => {
+                    if (point[2] > CONFIDENCE_THRESHOLD) {
+                        drawPoint(point, '#FFFFFF');
+                    }
+                });
+            });
+        }
+
+        // 修改後的 drawLine
+        function drawLine(p1, p2, color) {
+            // 伺服器現在傳來的是絕對座標，直接使用即可，不需要再乘 canvas.width
+            const x1 = p1[0];
+            const y1 = p1[1];
+            const x2 = p2[0];
+            const y2 = p2[1];
+
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 3;
+            ctx.stroke();
+        }
+
+        // 修改後的 drawPoint
+        function drawPoint(p, color) {
+            const x = p[0]; // 直接使用
+            const y = p[1]; // 直接使用
+
+            ctx.beginPath();
+            ctx.arc(x, y, 4, 0, 2 * Math.PI);
+            ctx.fillStyle = color;
+            ctx.fill();
+        }
+
+        // 啟動連線
+        connect();
+
+    </script>
+</body>
+</html>
