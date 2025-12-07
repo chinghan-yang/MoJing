@@ -5,12 +5,13 @@ import asyncio
 import threading
 import websockets
 import numpy as np
+import math
 from ultralytics import YOLO
 
 # --- 設定參數 (Configuration) ---
 CONFIG = {
     "source": "rec_20251117_172908.mp4",  # 輸入來源
-    "mirror": True,  # 鏡像翻轉
+    "mirror": True,  # 鏡像翻轉 (僅對 Webcam 有效)
     "width": 1920,  # Webcam 寬度
     "height": 1080,  # Webcam 高度
     "draw_skeleton": True,  # 是否繪製骨架
@@ -20,12 +21,11 @@ CONFIG = {
     "ws_port": 8765,
     "model_path": "yolo11n-pose.pt",
 
-    # 【新增】 骨架節點信心門檻
-    "keypoint_threshold": 0.9
+    # 骨架節點信心門檻
+    "keypoint_threshold": 0.5
 }
 
 # --- 骨架連線定義 (COCO 格式: [起點, 終點, 顏色RGB]) ---
-# 顏色格式為 BGR (OpenCV)
 SKELETON_CONNECTIONS = [
     (5, 7, (0, 255, 255)), (7, 9, (0, 255, 255)),  # 左手 (黃)
     (6, 8, (0, 255, 0)), (8, 10, (0, 255, 0)),  # 右手 (綠)
@@ -38,7 +38,7 @@ SKELETON_CONNECTIONS = [
 ]
 
 
-# --- WebSocket 伺服器類別 (維持不變) ---
+# --- WebSocket 伺服器類別 ---
 class WebSocketServer:
     def __init__(self, host, port):
         self.host = host
@@ -78,6 +78,17 @@ class WebSocketServer:
             await asyncio.gather(*[client.send(message) for client in self.clients], return_exceptions=True)
 
 
+# --- 輔助函式: 計算角度 ---
+def calculate_azimuth_angle(cx, cy, img_w, img_h):
+    img_cx = img_w / 2
+    img_cy = img_h / 2
+    dx = cx - img_cx
+    dy = cy - img_cy
+    theta = math.degrees(math.atan2(dy, dx))
+    angle = (theta + 90) % 360
+    return int(angle)
+
+
 # --- 主程式邏輯 ---
 def main():
     if CONFIG["save_json"]:
@@ -88,13 +99,10 @@ def main():
     print(f"[AI] Loading YOLOv11 model: {CONFIG['model_path']}...")
     model = YOLO(CONFIG["model_path"])
 
-    # 嘗試開啟來源
     source = CONFIG["source"]
-    # 如果是數字字串 (e.g. "0") 轉為 int，否則視為檔案路徑
     if isinstance(source, str) and source.isdigit():
         source = int(source)
 
-    # 根據來源決定是否加入 CAP_DSHOW (Windows Webcam 修正)
     if source == 0 or (isinstance(source, int)):
         cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG["width"])
@@ -107,7 +115,7 @@ def main():
         return
 
     frame_count = 0
-    threshold = CONFIG["keypoint_threshold"]
+    kp_threshold = CONFIG["keypoint_threshold"]
 
     print("[System] Starting loop. Press 'q' to exit.")
 
@@ -121,80 +129,99 @@ def main():
             if source == 0 and CONFIG["mirror"]:
                 frame = cv2.flip(frame, 1)
 
-            # --- AI 推論 ---
-            results = model.predict(frame, verbose=False, conf=0.5)
+            img_h, img_w = frame.shape[:2]
+
+            # --- AI 推論 (conf=0.25) ---
+            results = model.predict(frame, verbose=False, conf=0.25)
             result = results[0]
 
-            # --- 資料解析與格式化 ---
-            # 取得絕對座標 (Pixel Coordinates)
-            keypoints_xy = result.keypoints.xy.cpu().numpy()  # (N, 17, 2)
-            confs_data = result.keypoints.conf.cpu().numpy()  # (N, 17)
+            keypoints_xy = result.keypoints.xy.cpu().numpy()
+            confs_data = result.keypoints.conf.cpu().numpy()
+            boxes_xywh = result.boxes.xywh.cpu().numpy() if result.boxes is not None else []
 
-            frame_json_data = []
-
-            # 用於繪圖的暫存列表 (只包含該 frame 的所有有效人體數據)
+            skeletons_list = []
+            percentage_list = []
+            angle_list = []
             people_to_draw = []
 
             if result.keypoints.has_visible:
                 for i, person_kpts in enumerate(keypoints_xy):
-                    person_formatted = []  # JSON 用
-                    person_draw_data = []  # 繪圖用 (儲存 x, y, valid_flag)
+                    person_formatted = []
+                    person_draw_data = []
+
+                    person_confs = confs_data[i] if confs_data is not None else np.zeros(17)
 
                     for j, (x, y) in enumerate(person_kpts):
-                        conf = confs_data[i][j] if confs_data is not None else 0.0
-
-                        # 【邏輯判斷】 Confidence Threshold Check
-                        if conf >= threshold:
-                            # 數值有效：保留 conf，標記為可繪製
+                        conf = person_confs[j]
+                        if conf >= kp_threshold:
                             final_conf = round(float(conf), 3)
                             is_valid = True
                         else:
-                            # 數值無效：conf 設為 -1，標記為不可繪製
                             final_conf = -1.0
                             is_valid = False
 
-                        # 存入 JSON 結構
                         person_formatted.append([float(x), float(y), final_conf])
-
-                        # 存入繪圖結構 (x, y, is_valid)
                         person_draw_data.append((int(x), int(y), is_valid))
 
-                    frame_json_data.append(person_formatted)
+                    skeletons_list.append(person_formatted)
                     people_to_draw.append(person_draw_data)
 
-            # --- 建立與傳送 JSON ---
-            json_output = {str(frame_count): frame_json_data}
+                    # 計算比例
+                    has_nose = person_confs[0] >= kp_threshold
+                    has_eyes = person_confs[1] >= kp_threshold and person_confs[2] >= kp_threshold
+                    has_shoulders = person_confs[5] >= kp_threshold and person_confs[6] >= kp_threshold
+
+                    pct = 0
+                    if has_nose and has_eyes and has_shoulders:
+                        pct = 100
+                    elif has_nose and has_eyes:
+                        pct = 50
+                    percentage_list.append(pct)
+
+                    # 計算角度
+                    current_angle = 0
+                    if len(boxes_xywh) > i:
+                        cx, cy = boxes_xywh[i][:2]
+                        current_angle = calculate_azimuth_angle(cx, cy, img_w, img_h)
+                    angle_list.append(current_angle)
+
+            # --- 建構最終 JSON (修改處) ---
+            json_output = {
+                "frame_index": frame_count,
+                "skeletons": skeletons_list,
+                "skeleton_percentage": percentage_list,
+                "angle": angle_list
+            }
+
+            # 【修改】 加入 indent=1 增加可讀性
             json_str = json.dumps(json_output, indent=1)
 
             if CONFIG["save_json"]:
                 filename = f"{frame_count:04d}.json"
+                # 【修改】 加入 newline='\n'
                 with open(os.path.join(CONFIG["output_dir"], filename), 'w', newline='\n') as f:
                     f.write(json_str)
 
             ws_server.broadcast(json_str)
 
-            # --- 動作 3: 視覺化 (手動繪製) ---
-            # 我們不再使用 result.plot()，因為它無法依據單點 threshold 隱藏
-            display_frame = frame.copy()  # 複製一份以免影響原始 frame
-
+            # --- 視覺化 ---
+            display_frame = frame.copy()
             if CONFIG["draw_skeleton"]:
-                for person_pts in people_to_draw:
-                    # person_pts 是一個 list: [(x, y, valid), (x, y, valid), ...]
-
-                    # 1. 繪製骨架連線 (Limbs)
+                for idx, person_pts in enumerate(people_to_draw):
                     for idx_a, idx_b, color in SKELETON_CONNECTIONS:
                         pt_a = person_pts[idx_a]
                         pt_b = person_pts[idx_b]
-
-                        # 只有當連線的「兩端點」都有效 (valid=True) 時才畫線
                         if pt_a[2] and pt_b[2]:
                             cv2.line(display_frame, (pt_a[0], pt_a[1]), (pt_b[0], pt_b[1]), color, 2)
-
-                    # 2. 繪製關鍵點 (Joints)
                     for x, y, is_valid in person_pts:
                         if is_valid:
-                            # 紅色圓點，半徑 4
                             cv2.circle(display_frame, (x, y), 4, (0, 0, 255), -1)
+
+                    if idx < len(percentage_list) and idx < len(angle_list):
+                        info_text = f"{percentage_list[idx]}% | {angle_list[idx]}deg"
+                        text_pos = person_pts[0][:2]
+                        cv2.putText(display_frame, info_text, (text_pos[0] - 20, text_pos[1] - 20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             cv2.imshow("YOLOv11 Pose Estimation", display_frame)
 
