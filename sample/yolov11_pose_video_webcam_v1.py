@@ -11,8 +11,8 @@ from datetime import datetime
 CONFIG = {
     "source": "rec_20251117_172908.mp4",  # 輸入來源: 0 代表 Webcam, 或者輸入影片路徑如 "video.mp4"
     "mirror": True,  # 是否啟用水平翻轉 (僅對 Webcam 有效)
-    "width": 1280,  # Webcam 寬度
-    "height": 720,  # Webcam 高度
+    "width": 1920,  # Webcam 寬度
+    "height": 1080,  # Webcam 高度
     "draw_skeleton": True,  # 是否在畫面上繪製骨架
     "save_json": False,  # 是否儲存 JSON 檔案
     "output_dir": "output",  # JSON 輸出資料夾
