@@ -10,7 +10,7 @@ from ultralytics import YOLO
 
 # --- 設定參數 (Configuration) ---
 CONFIG = {
-    "source": "rec_20251117_172908.mp4",  # 輸入來源
+    "source": 0,  # 輸入來源: 0 代表 Webcam, 或者輸入影片路徑如 "video.mp4"
     "mirror": True,  # 鏡像翻轉 (僅對 Webcam 有效)
     "width": 1920,  # Webcam 寬度
     "height": 1080,  # Webcam 高度
@@ -24,7 +24,7 @@ CONFIG = {
     # 骨架節點信心門檻
     "keypoint_threshold": 0.9,
 
-    # 【新增】 計算角度用的圓心座標 (預設為畫面中心，可自行調整)
+    # 計算角度用的圓心座標 (預設為畫面中心，可自行調整)
     "center_x": 965,
     "center_y": 285
 }
@@ -83,16 +83,21 @@ class WebSocketServer:
 
 
 # --- 【修改】 輔助函式: 計算相對於圓心的方位角 ---
-def calculate_position_angle(center_pt, target_pt):
+def calculate_position_angle(center_pt, target_pt, is_mirror=False):
     """
-    計算 target_pt 相對於 center_pt 的方位角 (逆時針 CCW)。
-    影像座標系: X向右, Y向下
+    計算 target_pt 相對於 center_pt 的方位角。
 
-    定義:
-    - 12點鐘 (上) = 0度
-    - 9點鐘 (左) = 90度
-    - 6點鐘 (下) = 180度
-    - 3點鐘 (右) = 270度
+    模式 1: 一般模式 (is_mirror=False) -> 逆時針 (CCW)
+      - 12點鐘 (上) = 0度
+      - 9點鐘 (左) = 90度
+      - 6點鐘 (下) = 180度
+      - 3點鐘 (右) = 270度
+
+    模式 2: 鏡像模式 (is_mirror=True) -> 順時針 (CW)
+      - 12點鐘 (上) = 0度
+      - 3點鐘 (右) = 90度
+      - 6點鐘 (下) = 180度
+      - 9點鐘 (左) = 270度
     """
     dx = target_pt[0] - center_pt[0]
     dy = target_pt[1] - center_pt[1]
@@ -100,19 +105,21 @@ def calculate_position_angle(center_pt, target_pt):
     # math.atan2(y, x) 標準定義: 右(0), 下(90), 左(180), 上(-90)
     angle_deg = math.degrees(math.atan2(dy, dx))
 
-    # 目標轉換:
-    # 上 (-90) -> 0
-    # 左 (180) -> 90
-    # 下 (90)  -> 180
-    # 右 (0)   -> 270
+    if is_mirror:
+        # --- 鏡像模式 (順時針) ---
+        # Up(-90) + 90 = 0
+        # Right(0) + 90 = 90
+        # Down(90) + 90 = 180
+        # Left(180) + 90 = 270
+        final_angle = angle_deg + 90
+    else:
+        # --- 一般模式 (逆時針) ---
+        # Up(-90) + 90 = 0 -> -0 = 0
+        # Left(180) + 90 = 270 -> -270 = 90
+        # Down(90) + 90 = 180 -> -180 = 180
+        # Right(0) + 90 = 90 -> -90 = 270
+        final_angle = -(angle_deg + 90)
 
-    # 公式推導: -(angle + 90) % 360
-    # -(-90+90) = 0
-    # -(180+90) = -270 = 90
-    # -(90+90) = -180 = 180
-    # -(0+90) = -90 = 270
-
-    final_angle = -(angle_deg + 90)
     return int(final_angle % 360)
 
 
@@ -147,6 +154,10 @@ def main():
     # 取得設定的圓心
     center_point = (CONFIG["center_x"], CONFIG["center_y"])
 
+    # 判斷是否開啟了鏡像模式 (Webcam 且 Mirror=True)
+    is_mirror_mode = (source == 0 and CONFIG["mirror"])
+
+    print(f"[System] Mirror Mode: {is_mirror_mode}")
     print("[System] Starting loop. Press 'q' to exit.")
 
     try:
@@ -156,7 +167,8 @@ def main():
                 print("[System] End of stream.")
                 break
 
-            if source == 0 and CONFIG["mirror"]:
+            # 如果是 Webcam 且設定鏡像，進行翻轉
+            if is_mirror_mode:
                 frame = cv2.flip(frame, 1)
 
             img_h, img_w = frame.shape[:2]
@@ -208,8 +220,8 @@ def main():
                     if target_point is None:
                         continue
 
-                    # --- 【步驟 2】 計算角度 ---
-                    current_angle = calculate_position_angle(center_point, target_point)
+                    # --- 【步驟 2】 計算角度 (傳入 is_mirror_mode) ---
+                    current_angle = calculate_position_angle(center_point, target_point, is_mirror=is_mirror_mode)
 
                     # --- 【步驟 3】 處理骨架資料 (僅針對通過篩選的人) ---
                     person_formatted = []
