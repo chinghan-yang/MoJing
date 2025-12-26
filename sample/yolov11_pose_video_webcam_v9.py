@@ -20,7 +20,7 @@ CONFIG = {
     "output_dir": "output",
     "ws_host": "localhost",
     "ws_port": 8765,
-    "model_path": "yolo11n-pose.pt",
+    "model_path": "yolo11m-pose.pt",
 
     # 骨架節點信心門檻
     "keypoint_threshold": 0.9,
