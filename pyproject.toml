@@ -1,0 +1,10 @@
+[project]
+name = "mojing"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ultralytics>=8.4.12",
+    "websockets>=16.0",
+]
