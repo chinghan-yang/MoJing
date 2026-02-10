@@ -31,7 +31,7 @@ CONFIG = {
     "center_y": 155,
 
     # 遮罩檔案路徑
-    "mask_path": "well_mask_20251226.npy"
+    "mask_path": "well_lab.npy"
 }
 
 # --- 骨架連線定義 (COCO 格式: [起點, 終點, 顏色RGB]) ---
